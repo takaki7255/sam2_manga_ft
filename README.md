@@ -1,4 +1,4 @@
-# Train SAM 2: Segment Anything in Images
+# Train SAM 2: Segment Anything 2 in 60 lines of code (Guide/code)
 This repository contain toturial code fine/tuning training segment anything in 60 lines of code. 
 It identical to the original SAM 2 repository  but contain two additional files train_model.py for training/fine-tuning,
 and test_model.py for loading and evaluating the trained model.
@@ -6,6 +6,10 @@ The training is done on the [LabPics 1 dataset](https://zenodo.org/records/36974
 
 
 
+
+#
+#
+#
 
 # Original readme
 
