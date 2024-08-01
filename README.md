@@ -1,6 +1,6 @@
-# Train SAM 2: Segment Anything 2 in 60 lines of code (Guide/code)
+# Train SAM 2: Train/Fine-Tune Segment Anything 2 (Guide/code)
 This repository contain toturial code for fine-tuning/training segment anything 2.
-The training script can be found in [TRAIN.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN.py) and should work as is with the [LabPics 1 dataset](https://zenodo.org/records/3697452/files/LabPicsV1.zip?download=1). 
+The training script can be found in [TRAIN.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN.py) and should work as is with the [LabPics 1 dataset](https://zenodo.org/records/3697452/files/LabPicsV1.zip?download=1), the code is well documented and should work as is. 
 
 The code for testing the fine-tuned net can be found in [TEST_Net.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TEST_Net.py)
 
