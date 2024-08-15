@@ -3,7 +3,6 @@
 import numpy as np
 import torch
 import cv2
-import os
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -14,14 +13,19 @@ torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
 image_path = r"sample_image.jpg" # path to image
 mask_path = r"sample_mask.png" # path to mask, the mask will define the image region to segment
-num_samples = 30 # number of points/segment to sample
+
 def read_image(image_path, mask_path): # read and resize image and mask
-        img = cv2.imread(image_path)[...,::-1]  # read image
-        mask = cv2.imread(mask_path,0)
+        img = cv2.imread(image_path)[...,::-1]  # read image as rgb
+        mask = cv2.imread(mask_path,0) # mask of the region we want to segment
+
+        # Resize image to maximum size of 1024
+
         r = np.min([1024 / img.shape[1], 1024 / img.shape[0]])
         img = cv2.resize(img, (int(img.shape[1] * r), int(img.shape[0] * r)))
         mask = cv2.resize(mask, (int(mask.shape[1] * r), int(mask.shape[0] * r)),interpolation=cv2.INTER_NEAREST)
         return img, mask
+image,mask = read_image(image_path, mask_path)
+num_samples = 30 # number of points/segment to sample
 def get_points(mask,num_points): # Sample points inside the input mask
         points=[]
         for i in range(num_points):
@@ -29,10 +33,9 @@ def get_points(mask,num_points): # Sample points inside the input mask
             yx = np.array(coords[np.random.randint(len(coords))])
             points.append([[yx[1], yx[0]]])
         return np.array(points)
-
-# read image and sample points
-image,mask = read_image(image_path, mask_path)
 input_points = get_points(mask,num_samples)
+# read image and sample points
+
 
 # Load model you need to have pretrained model already made
 sam2_checkpoint = "sam2_hiera_small.pt" # "sam2_hiera_large.pt"
@@ -54,9 +57,8 @@ with torch.no_grad():
 
 # Short predicted masks from high to low score
 
-np_masks = np.array(masks[:,0].cpu().numpy())
-np_scores = scores[:,0].float().cpu().numpy()
-shorted_masks = np_masks[np.argsort(np_scores)][::-1]
+masks=masks[:,0].astype(bool)
+shorted_masks = masks[np.argsort(scores[:,0])][::-1].astype(bool)
 
 # Stitch predicted mask into one segmentation mask
 
@@ -73,10 +75,7 @@ for i in range(shorted_masks.shape[0]):
 height, width = seg_map.shape
 
 # Create an empty RGB image for the colored annotation
-rgb_image = np.zeros((height, width, 3), dtype=np.uint8)
-# Map each class number to a random  color
-
-
+rgb_image = np.zeros((seg_map.shape[0], seg_map.shape[1], 3), dtype=np.uint8)
 for id_class in range(1,seg_map.max()+1):
     rgb_image[seg_map == id_class] = [np.random.randint(255), np.random.randint(255), np.random.randint(255)]
 
