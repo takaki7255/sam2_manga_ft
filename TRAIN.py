@@ -1,5 +1,9 @@
-# Train/Fine Tune SAM 2 on LabPics 1 dataset
-# Labpics can be downloaded from: https://zenodo.org/records/3697452/files/LabPicsV1.zip?download=1
+# Train/Fine-Tune SAM 2 on the LabPics 1 dataset
+
+# Toturial: https://medium.com/@sagieppel/train-fine-tune-segment-anything-2-sam-2-in-60-lines-of-code-928dd29a63b3
+# Main repo: https://github.com/facebookresearch/segment-anything-2
+# Labpics Dataset can be downloaded from: https://zenodo.org/records/3697452/files/LabPicsV1.zip?download=1
+# Pretrained models for sam2 Can be downloaded from: https://github.com/facebookresearch/segment-anything-2?tab=readme-ov-file#download-checkpoints
 
 import numpy as np
 import torch
@@ -10,7 +14,7 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 # Read data
 
-data_dir=r"LabPicsV1/" # Path to dataset (LabPics 1)
+data_dir=r"LabPicsV1//" # Path to dataset (LabPics 1)
 data=[] # list of files in dataset
 for ff, name in enumerate(os.listdir(data_dir+"Simple/Train/Image/")):  # go over all folder annotation
     data.append({"image":data_dir+"Simple/Train/Image/"+name,"annotation":data_dir+"Simple/Train/Instance/"+name[:-4]+".png"})
@@ -18,46 +22,46 @@ def read_batch(data): # read random image and its annotaion from  the dataset (L
 
    #  select image
 
-        ent  = data[np.random.randint(len(data))] #
+        ent  = data[np.random.randint(len(data))] # choose random entry
         Img = cv2.imread(ent["image"])[...,::-1]  # read image
-        ann_map = cv2.imread(ent["annotation"])
+        ann_map = cv2.imread(ent["annotation"]) # read annotation
 
    # resize image
 
-        r = np.min([1024 / Img.shape[1], 1024 / Img.shape[0]])
+        r = np.min([1024 / Img.shape[1], 1024 / Img.shape[0]]) # scalling factor
         Img = cv2.resize(Img, (int(Img.shape[1] * r), int(Img.shape[0] * r)))
         ann_map = cv2.resize(ann_map, (int(ann_map.shape[1] * r), int(ann_map.shape[0] * r)),interpolation=cv2.INTER_NEAREST)
 
    # merge vessels and materials annotations
 
-        mat_map = ann_map[:,:,0]
-        ves_map = ann_map[:,:,2]
-        mat_map[mat_map==0] = ves_map[mat_map==0]*(mat_map.max()+1)
+        mat_map = ann_map[:,:,0] # material annotation map
+        ves_map = ann_map[:,:,2] # vessel  annotaion map
+        mat_map[mat_map==0] = ves_map[mat_map==0]*(mat_map.max()+1) # merge maps
 
    # Get binary masks and points
 
-        inds = np.unique(mat_map)[1:]
+        inds = np.unique(mat_map)[1:] # load all indices
         points= []
         masks = []
         for ind in inds:
-            mask=(mat_map == ind).astype(np.uint8)
+            mask=(mat_map == ind).astype(np.uint8) # make binary mask corresponding to index ind
             masks.append(mask)
-            coords = np.argwhere(mask > 0)
-            yx = np.array(coords[np.random.randint(len(coords))])
+            coords = np.argwhere(mask > 0) # get all coordinates in mask
+            yx = np.array(coords[np.random.randint(len(coords))]) # choose random point/coordinate
             points.append([[yx[1], yx[0]]])
         return Img,np.array(masks),np.array(points), np.ones([len(masks),1])
 
 # Load model
 
-sam2_checkpoint = "sam2_hiera_small.pt" # "sam2_hiera_large.pt"
-model_cfg = "sam2_hiera_s.yaml" # "sam2_hiera_l.yaml"
-sam2_model = build_sam2(model_cfg, sam2_checkpoint, device="cuda")
+sam2_checkpoint = "sam2_hiera_small.pt" # path to model weight (pre model loaded from: https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_small.pt)
+model_cfg = "sam2_hiera_s.yaml" #  model config
+sam2_model = build_sam2(model_cfg, sam2_checkpoint, device="cuda") # load model
 predictor = SAM2ImagePredictor(sam2_model)
 
 # Set training parameters
 
-predictor.model.sam_mask_decoder.train(True)
-predictor.model.sam_prompt_encoder.train(True)
+predictor.model.sam_mask_decoder.train(True) # enable training of mask decoder
+predictor.model.sam_prompt_encoder.train(True) # enable training of prompt encoder
 optimizer=torch.optim.AdamW(params=predictor.model.parameters(),lr=1e-5,weight_decay=4e-5)
 scaler = torch.cuda.amp.GradScaler() # mixed precision
 
@@ -65,10 +69,9 @@ scaler = torch.cuda.amp.GradScaler() # mixed precision
 
 for itr in range(100000):
     with torch.cuda.amp.autocast(): # cast to mix precision
-        #with torch.cuda.amp.autocast():
             image,mask,input_point, input_label = read_batch(data) # load data batch
             if mask.shape[0]==0: continue # ignore empty batches
-            predictor.set_image(image) # apply SAM image encodet to the image
+            predictor.set_image(image) # apply SAM image encoder to the image
 
             # prompt encoding
 
@@ -85,8 +88,8 @@ for itr in range(100000):
             # Segmentaion Loss caclulation
 
             gt_mask = torch.tensor(mask.astype(np.float32)).cuda()
-            prd_mask = torch.sigmoid(prd_masks[:, 0])
-            seg_loss = (-gt_mask * torch.log(prd_mask + 0.00001) - (1 - gt_mask) * torch.log((1 - prd_mask) + 0.00001)).mean()
+            prd_mask = torch.sigmoid(prd_masks[:, 0])# Turn logit map to probability map
+            seg_loss = (-gt_mask * torch.log(prd_mask + 0.00001) - (1 - gt_mask) * torch.log((1 - prd_mask) + 0.00001)).mean() # cross entropy loss
 
             # Score loss calculation (intersection over union) IOU
 
@@ -102,7 +105,7 @@ for itr in range(100000):
             scaler.step(optimizer)
             scaler.update() # Mix precision
 
-            if itr%1000==0: torch.save(predictor.model.state_dict(), "model.torch") # save model
+            if itr%1000==0: torch.save(predictor.model.state_dict(), "model.torch");print("save model")
 
             # Display results
 
