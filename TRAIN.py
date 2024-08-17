@@ -18,6 +18,8 @@ data_dir=r"LabPicsV1//" # Path to dataset (LabPics 1)
 data=[] # list of files in dataset
 for ff, name in enumerate(os.listdir(data_dir+"Simple/Train/Image/")):  # go over all folder annotation
     data.append({"image":data_dir+"Simple/Train/Image/"+name,"annotation":data_dir+"Simple/Train/Instance/"+name[:-4]+".png"})
+
+
 def read_batch(data): # read random image and its annotaion from  the dataset (LabPics)
 
    #  select image
