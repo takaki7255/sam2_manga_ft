@@ -64,6 +64,11 @@ predictor = SAM2ImagePredictor(sam2_model)
 
 predictor.model.sam_mask_decoder.train(True) # enable training of mask decoder
 predictor.model.sam_prompt_encoder.train(True) # enable training of prompt encoder
+'''
+#The main part of the net is the image encoder, if you have good GPU you can enable training of this part by using:
+predictor.model.image_encoder.train(True)
+#Note that for this case, you will also need to scan the SAM2 code for “no_grad” commands and remove them (“ no_grad” blocks the gradient collection, which saves memory but prevents training).
+'''
 optimizer=torch.optim.AdamW(params=predictor.model.parameters(),lr=1e-5,weight_decay=4e-5)
 scaler = torch.cuda.amp.GradScaler() # mixed precision
 
