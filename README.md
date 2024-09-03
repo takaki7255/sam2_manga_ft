@@ -7,7 +7,7 @@ You can find the full toturial associate with code [at this LINK](https://medium
 The training script can be found in [TRAIN.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN.py) or [TRAIN_multi_image_batch.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN_multi_image_batch.py) and should work as is with the [LabPics 1 dataset](https://zenodo.org/records/3697452/files/LabPicsV1.zip?download=1), the code is documented and should work as is.
 
 
-Note [TRAIN.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN.py) use single image per batch, while [TRAIN_multi_image_batch.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN_multi_image_batch.py) use several images per batch other wise they are the same.
+Note [TRAIN.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN.py) use single image per batch, while [TRAIN_multi_image_batch.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN_multi_image_batch.py) use several images per batch, other then this they are the same.
 
 The code for loading and using the fine-tuned net can be found in [TEST_Net.py](https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TEST_Net.py)
 
