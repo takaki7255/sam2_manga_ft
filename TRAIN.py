@@ -1,5 +1,8 @@
 # Train/Fine-Tune SAM 2 on the LabPics 1 dataset
 
+# This script use a single image batch, if you want to train with multi image per batch check this script:
+# https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN_multi_image_batch.py
+
 # Toturial: https://medium.com/@sagieppel/train-fine-tune-segment-anything-2-sam-2-in-60-lines-of-code-928dd29a63b3
 # Main repo: https://github.com/facebookresearch/segment-anything-2
 # Labpics Dataset can be downloaded from: https://zenodo.org/records/3697452/files/LabPicsV1.zip?download=1
