@@ -68,7 +68,7 @@ def read_batch(data,batch_size=4):
               lmask.append(mask)
               linput_point.append(input_point)
 
-      return limage, np.array(lmask), np.array(linput_point),  np.ones([sz,1])
+      return limage, np.array(lmask), np.array(linput_point),  np.ones([batch_size,1])
 
 
 # Load model
