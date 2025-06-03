@@ -1,124 +1,189 @@
-# Train/Fine-Tune SAM 2 on the LabPics 1 dataset
+#!/usr/bin/env python
+"""
+Train SAM-2 on Manga Balloon COCO Dataset
+ディレクトリ例:
+ sam2_manga_ft/
+ ├ sam2/                  # Meta の公式リポジトリ
+ │ └ sam2_configs/__init__.py  ← 空ファイルで OK
+ ├ data/
+ │   ├ images/            # 元画像
+ │   └ annotations/manga_balloon.json
+ ├ checkpoints/sam2_hiera_small.pt
+ └ train.py               # ← このファイル
+"""
 
-# This script use a single image batch, if you want to train with multi image per batch check this script:
-# https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/blob/main/TRAIN_multi_image_batch.py
+import os, json, cv2, numpy as np
+from pathlib import Path
 
-# Toturial: https://medium.com/@sagieppel/train-fine-tune-segment-anything-2-sam-2-in-60-lines-of-code-928dd29a63b3
-# Main repo: https://github.com/facebookresearch/segment-anything-2
-# Labpics Dataset can be downloaded from: https://zenodo.org/records/3697452/files/LabPicsV1.zip?download=1
-# Pretrained models for sam2 Can be downloaded from: https://github.com/facebookresearch/segment-anything-2?tab=readme-ov-file#download-checkpoints
-
-import numpy as np
 import torch
-import cv2
-import os
+from torch.utils.data import Dataset, DataLoader
+from pycocotools import mask as maskUtils
+from tqdm import tqdm
+
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-# Read data
 
-data_dir=r"LabPicsV1//" # Path to dataset (LabPics 1)
-data=[] # list of files in dataset
-for ff, name in enumerate(os.listdir(data_dir+"Simple/Train/Image/")):  # go over all folder annotation
-    data.append({"image":data_dir+"Simple/Train/Image/"+name,"annotation":data_dir+"Simple/Train/Instance/"+name[:-4]+".png"})
+# ---------------------- Dataset ---------------------- #
+class MangaBalloonCOCODataset(Dataset):
+    """COCO 形式（1 クラス）の最小実装"""
+
+    def __init__(self, root: str, json_file: str, img_size: int = 1024):
+        self.root = Path(root)
+        with open(json_file) as f:
+            coco = json.load(f)
+
+        self.img_dir = self.root / "images"
+        self.anns = coco["annotations"]
+        self.imgs = {img["id"]: img for img in coco["images"]}
+        self.img_size = img_size
+
+    def __len__(self):
+        return len(self.anns)
+
+    def __getitem__(self, idx):
+        ann = self.anns[idx]
+        meta = self.imgs[ann["image_id"]]
+        img_path = self.img_dir / meta["file_name"]
+
+        # 画像読み込み & リサイズ（RGB）
+        img = cv2.imread(str(img_path))[:, :, ::-1]
+        img = cv2.resize(img, (self.img_size, self.img_size),
+                         interpolation=cv2.INTER_LINEAR)
+
+        # polygon → mask → リサイズ
+        rles = maskUtils.frPyObjects(ann["segmentation"],
+                                     meta["height"], meta["width"])
+        mask = maskUtils.decode(maskUtils.merge(rles)).astype(np.float32)
+        mask = cv2.resize(mask, (self.img_size, self.img_size),
+                          interpolation=cv2.INTER_NEAREST)
+
+        # Torch Tensor へ
+        img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        mask_t = torch.from_numpy(mask)[None, ...]
+
+        return {"image": img_t, "mask": mask_t}
 
 
-def read_batch(data): # read random image and its annotaion from  the dataset (LabPics)
+# ---------------------- Utility ---------------------- #
+def random_click_points(mask_batch: torch.Tensor) -> np.ndarray:
+    """(B,1,H,W) のバイナリマスクから 1 点ランダムクリックを返す"""
+    pts = []
+    for mk in mask_batch:
+        ys, xs = torch.nonzero(mk[0], as_tuple=True)
+        if len(xs) == 0:              # マスクが空なら中央
+            h, w = mk.shape[-2:]
+            pts.append([[w // 2, h // 2]])
+        else:
+            i = torch.randint(0, len(xs), (1,)).item()
+            pts.append([[xs[i].item(), ys[i].item()]])
+    return np.array(pts, dtype=np.int64)
 
-   #  select image
 
-        ent  = data[np.random.randint(len(data))] # choose random entry
-        Img = cv2.imread(ent["image"])[...,::-1]  # read image
-        ann_map = cv2.imread(ent["annotation"]) # read annotation
+# ---------------------- Training ---------------------- #
+def train():
+    # ハイパラ & パス
+    img_size = 1024
+    batch_size = 4
+    num_epochs = 20
 
-   # resize image
+    root_dir = "data"
+    ann_file = "data/annotations/manga_balloon.json"
+    checkpoint_path = "checkpoints/sam2_hiera_small.pt"
+    model_cfg = "sam2_hiera_s"      # .yaml を付けない
 
-        r = np.min([1024 / Img.shape[1], 1024 / Img.shape[0]]) # scalling factor
-        Img = cv2.resize(Img, (int(Img.shape[1] * r), int(Img.shape[0] * r)))
-        ann_map = cv2.resize(ann_map, (int(ann_map.shape[1] * r), int(ann_map.shape[0] * r)),interpolation=cv2.INTER_NEAREST)
+    # デバイス
+    if torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
 
-   # merge vessels and materials annotations
+    amp_enable = device == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enable)
 
-        mat_map = ann_map[:,:,0] # material annotation map
-        ves_map = ann_map[:,:,2] # vessel  annotaion map
-        mat_map[mat_map==0] = ves_map[mat_map==0]*(mat_map.max()+1) # merge maps
+    # データローダ
+    ds = MangaBalloonCOCODataset(root_dir, ann_file, img_size)
+    loader = DataLoader(ds, batch_size=batch_size,
+                        shuffle=True, num_workers=0)
 
-   # Get binary masks and points
+    # モデル
+    sam2_model = build_sam2(model_cfg, checkpoint_path, device=device)
+    predictor = SAM2ImagePredictor(sam2_model)
+    optimizer = torch.optim.AdamW(predictor.model.parameters(),
+                                  lr=1e-5, weight_decay=4e-5)
 
-        inds = np.unique(mat_map)[1:] # load all indices
-        points= []
-        masks = []
-        for ind in inds:
-            mask=(mat_map == ind).astype(np.uint8) # make binary mask corresponding to index ind
-            masks.append(mask)
-            coords = np.argwhere(mask > 0) # get all coordinates in mask
-            yx = np.array(coords[np.random.randint(len(coords))]) # choose random point/coordinate
-            points.append([[yx[1], yx[0]]])
-        return Img,np.array(masks),np.array(points), np.ones([len(masks),1])
+    global_step, mean_iou = 0, 0.0
 
-# Load model
+    for epoch in range(num_epochs):
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch")
+        for batch in pbar:
+            global_step += 1
+            imgs = batch["image"].to(device)
+            masks_gt = batch["mask"].to(device)
 
-sam2_checkpoint = "sam2_hiera_small.pt" # path to model weight (pre model loaded from: https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_small.pt)
-model_cfg = "sam2_hiera_s.yaml" #  model config
-sam2_model = build_sam2(model_cfg, sam2_checkpoint, device="cuda") # load model
-predictor = SAM2ImagePredictor(sam2_model)
+            # predictor が受ける形式へ変換 (List[np.ndarray])
+            imgs_np = [(img * 255).byte().permute(1, 2, 0).cpu().numpy() for img in imgs]
+            # ランダムクリック生成
+            pts = random_click_points(masks_gt)
+            lbl = np.ones((len(pts), 1), dtype=np.int64)
 
-# Set training parameters
+            from contextlib import nullcontext
+            amp_ctx = torch.cuda.amp.autocast(enabled=True) if device == "cuda" else nullcontext()
+            with amp_ctx:
+                predictor.set_image_batch(imgs_np)
 
-predictor.model.sam_mask_decoder.train(True) # enable training of mask decoder
-predictor.model.sam_prompt_encoder.train(True) # enable training of prompt encoder
-'''
-#The main part of the net is the image encoder, if you have good GPU you can enable training of this part by using:
-predictor.model.image_encoder.train(True)
-#Note that for this case, you will also need to scan the SAM2 code for “no_grad” commands and remove them (“ no_grad” blocks the gradient collection, which saves memory but prevents training).
-'''
-optimizer=torch.optim.AdamW(params=predictor.model.parameters(),lr=1e-5,weight_decay=4e-5)
-scaler = torch.cuda.amp.GradScaler() # mixed precision
+                mask_in, coords_t, labels_t, _ = predictor._prep_prompts(
+                    pts, lbl, box=None, mask_logits=None, normalize_coords=True
+                )
+                sparse_emb, dense_emb = predictor.model.sam_prompt_encoder(
+                    points=(coords_t, labels_t), boxes=None, masks=None)
 
-# Training loop
+                high_res_feats = [f[-1].unsqueeze(0)
+                                  for f in predictor._features["high_res_feats"]]
 
-for itr in range(100000):
-    with torch.cuda.amp.autocast(): # cast to mix precision
-            image,mask,input_point, input_label = read_batch(data) # load data batch
-            if mask.shape[0]==0: continue # ignore empty batches
-            predictor.set_image(image) # apply SAM image encoder to the image
+                low_masks, scores, _, _ = predictor.model.sam_mask_decoder(
+                    image_embeddings=predictor._features["image_embed"],
+                    image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_emb,
+                    dense_prompt_embeddings=dense_emb,
+                    multimask_output=True,
+                    repeat_image=False,
+                    high_res_features=high_res_feats)
 
-            # prompt encoding
+                masks_pred = predictor._transforms.postprocess_masks(
+                    low_masks, predictor._orig_hw[-1])
+                masks_pred = torch.sigmoid(masks_pred[:, 0]).unsqueeze(1)  # [B, 1, H, W]
 
-            mask_input, unnorm_coords, labels, unnorm_box = predictor._prep_prompts(input_point, input_label, box=None, mask_logits=None, normalize_coords=True)
-            sparse_embeddings, dense_embeddings = predictor.model.sam_prompt_encoder(points=(unnorm_coords, labels),boxes=None,masks=None,)
+                # 損失
+                eps = 1e-6
+                seg_loss = (-masks_gt * torch.log(masks_pred + eps) -
+                            (1 - masks_gt) * torch.log(1 - masks_pred + eps)).mean()
 
-            # mask decoder
+                inter = (masks_gt * (masks_pred > 0.5)).sum((1, 2, 3))
+                union = masks_gt.sum((1, 2, 3)) + \
+                    (masks_pred > 0.5).sum((1, 2, 3)) - inter
+                iou = inter / (union + eps)
+                score_loss = torch.abs(scores[:, 0] - iou).mean()
 
-            batched_mode = unnorm_coords.shape[0] > 1 # multi object prediction
-            high_res_features = [feat_level[-1].unsqueeze(0) for feat_level in predictor._features["high_res_feats"]]
-            low_res_masks, prd_scores, _, _ = predictor.model.sam_mask_decoder(image_embeddings=predictor._features["image_embed"][-1].unsqueeze(0),image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),sparse_prompt_embeddings=sparse_embeddings,dense_prompt_embeddings=dense_embeddings,multimask_output=True,repeat_image=batched_mode,high_res_features=high_res_features,)
-            prd_masks = predictor._transforms.postprocess_masks(low_res_masks, predictor._orig_hw[-1])# Upscale the masks to the original image resolution
+                loss = seg_loss + 0.05 * score_loss
 
-            # Segmentaion Loss caclulation
-
-            gt_mask = torch.tensor(mask.astype(np.float32)).cuda()
-            prd_mask = torch.sigmoid(prd_masks[:, 0])# Turn logit map to probability map
-            seg_loss = (-gt_mask * torch.log(prd_mask + 0.00001) - (1 - gt_mask) * torch.log((1 - prd_mask) + 0.00001)).mean() # cross entropy loss
-
-            # Score loss calculation (intersection over union) IOU
-
-            inter = (gt_mask * (prd_mask > 0.5)).sum(1).sum(1)
-            iou = inter / (gt_mask.sum(1).sum(1) + (prd_mask > 0.5).sum(1).sum(1) - inter)
-            score_loss = torch.abs(prd_scores[:, 0] - iou).mean()
-            loss=seg_loss+score_loss*0.05  # mix losses
-
-            # apply back propogation
-
-            predictor.model.zero_grad() # empty gradient
-            scaler.scale(loss).backward()  # Backpropogate
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
             scaler.step(optimizer)
-            scaler.update() # Mix precision
+            scaler.update()
 
-            if itr%1000==0: torch.save(predictor.model.state_dict(), "model.torch");print("save model")
+            mean_iou = 0.99 * mean_iou + 0.01 * iou.mean().item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}",
+                             iou=f"{mean_iou:.3f}")
 
-            # Display results
+        # 各エポックで保存
+        torch.save(predictor.model.state_dict(),
+                   f"checkpoints/sam2_manga_epoch{epoch+1}.pt")
 
-            if itr==0: mean_iou=0
-            mean_iou = mean_iou * 0.99 + 0.01 * np.mean(iou.cpu().detach().numpy())
-            print("step)",itr, "Accuracy(IOU)=",mean_iou)
+
+# ---------------------- Entry ---------------------- #
+if __name__ == "__main__":
+    torch.multiprocessing.set_start_method("spawn", force=True)
+    train()
