@@ -144,6 +144,8 @@ def train():
     CLICKS_PER_MASK = 4
     CKPT_PATH      = "checkpoints/sam2_hiera_small.pt"
     MODEL_CFG      = "sam2_hiera_s"
+    SAVE_FREQ      = 5          # ★ 何エポックごとに保存するか
+    BEST_PATH      = "checkpoints/best_miou.pt"   # ★ ベストモデル保存先
     
     wandb.init(
     project="sam2-manga",            # 好きなプロジェクト名
@@ -190,6 +192,7 @@ def train():
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=0.1)  # 4 epoch ごとに 1/10
 
     global_step, mean_iou = 0, 0.0
+    best_miou   = -1.0
 
     samples_dir = Path("samples"); samples_dir.mkdir(exist_ok=True, parents=True)
     checkpoints_dir = Path("checkpoints"); checkpoints_dir.mkdir(exist_ok=True)
@@ -197,6 +200,7 @@ def train():
     for epoch in range(start_epoch, TOTAL_EPOCHS):
         pbar = tqdm(loader, desc=f"E{epoch+1}/{TOTAL_EPOCHS}", unit="batch")
         for step, batch in enumerate(pbar):
+            mean_iou_epoch = 0.0
             global_step += 1
             imgs   = batch["image"].to(device)
             masks_gt = batch["mask"].to(device)
@@ -206,8 +210,7 @@ def train():
             point_labels = np.ones(point_coords.shape[:2], dtype=np.int64)  # (B,N)
 
             # 画像を list[np.ndarray] → predictor
-            imgs_np = [(img * 255).byte().permute(1, 2, 0).cpu().numpy()
-                       for img in imgs]
+            imgs_np = [(img * 255).byte().permute(1, 2, 0).cpu().numpy() for img in imgs]
             predictor.set_image_batch(imgs_np)
 
             amp_ctx = torch.cuda.amp.autocast(enabled=True) if device == "cuda" else nullcontext()
@@ -231,17 +234,15 @@ def train():
                     multimask_output=False,
                     repeat_image=False,
                     high_res_features=hi_feats)
-                masks_pred = predictor._transforms.postprocess_masks(
-                    low_masks, predictor._orig_hw[-1])
-                masks_pred = torch.sigmoid(masks_pred[:, 0]).unsqueeze(1)
+                logits = predictor._transforms.postprocess_masks(low_masks, predictor._orig_hw[-1])           # (B,1,H,W) logits
+                masks_pred = torch.sigmoid(logits)
 
                 # --- loss ---
                 eps = 1e-6
                 # Balanced BCE
                 pos_pix = masks_gt.mean().item()
-                bce = F.binary_cross_entropy(
-                    masks_pred, masks_gt,
-                    weight=masks_gt * (1-pos_pix) + (1-masks_gt) * pos_pix)
+                # Balanced BCE ― ロジット版で安全に
+                bce = F.binary_cross_entropy_with_logits(logits, masks_gt, weight=masks_gt * (1-pos_pix) + (1-masks_gt) * pos_pix)
                 # Dice
                 inter = (masks_pred * masks_gt).sum((1,2,3))
                 dice = 1 - (2*inter + eps) / (masks_pred.sum((1,2,3))
@@ -262,6 +263,7 @@ def train():
                 iou = (inter / (union + eps)).mean().item()
 
             pbar.set_postfix(loss=f"{loss.item():.4f}", iou=f"{iou:.3f}")
+            mean_iou_epoch = (mean_iou_epoch * step + iou) / (step + 1) if step else iou
 
             # --- wandb log (optional) ---
             wandb.log({"train/loss": loss.item(),
@@ -282,13 +284,25 @@ def train():
         # --- epoch end ---
         scheduler.step()
 
-        torch.save({
-            "model":     model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler":    scaler.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "epoch":     epoch + 1,
-        }, checkpoints_dir / f"sam2_manga_epoch{epoch+1}.pt")
+        # ---- ベストモデル判定 ----
+        if mean_iou_epoch > best_miou:
+            best_miou = mean_iou_epoch
+            torch.save({"model": model.state_dict(),
+                        "miou":  best_miou,
+                        "epoch": epoch + 1},
+                    BEST_PATH)
+            print(f"✓ New best mIoU {best_miou:.4f}  →  {BEST_PATH}")
+
+        # ---- 周期保存 ----
+        if (epoch + 1) % SAVE_FREQ == 0:
+            torch.save({
+                "model":     model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scaler":    scaler.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch":     epoch + 1,
+                "miou":      mean_iou_epoch,
+            }, checkpoints_dir / f"sam2_manga_epoch{epoch+1}.pt")
 
 
 # ---------------------- Entry ---------------------- #
