@@ -15,13 +15,17 @@ import os, json, cv2, numpy as np
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from pycocotools import mask as maskUtils
 from tqdm import tqdm
+from contextlib import nullcontext
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 import wandb
+
+samples_dir = Path("samples"); samples_dir.mkdir(exist_ok=True)
 
 
 # ---------------------- Dataset ---------------------- #
@@ -79,14 +83,67 @@ def random_click_points(mask_batch: torch.Tensor) -> np.ndarray:
             pts.append([[xs[i].item(), ys[i].item()]])
     return np.array(pts, dtype=np.int64)
 
+def sample_points(mask_batch: torch.Tensor, n_pts=4):
+    pts = []
+    for mk in mask_batch:
+        ys, xs = torch.nonzero(mk[0], as_tuple=True)
+        if len(xs) == 0:
+            h, w = mk.shape[-2:]
+            pts.append([[w//2, h//2]])
+        else:
+            idx = torch.randperm(len(xs))[:n_pts]
+            pts.append([[int(xs[i]), int(ys[i])] for i in idx])
+    return np.array(pts, dtype=np.int64)   # (B, N, 2)
+
+def load_maybe_legacy_ckpt(path):
+    obj = torch.load(path, map_location="cpu")
+    return obj["model"] if isinstance(obj, dict) and "model" in obj else obj
+
+def resume_or_initialize(model,
+                         optimizer,
+                         scaler,
+                         ckpt_path: str | None) -> int:
+    """
+    *None* または存在しない ckpt → 新規学習 (epoch0)。
+    dict 形式なら model/optimizer/scaler/epoch を復元。
+    state-dict 形式なら model だけロード。
+    Returns: start_epoch
+    """
+    if ckpt_path is None or not Path(ckpt_path).exists():
+        print("⚑ No checkpoint. Start new training.")
+        return 0
+
+    obj = torch.load(ckpt_path, map_location="cpu")
+    # -------- model --------
+    if isinstance(obj, dict) and "model" in obj:
+        model.load_state_dict(obj["model"], strict=False)
+    else:
+        model.load_state_dict(obj, strict=False)
+
+    # -------- opt / scaler --------
+    if isinstance(obj, dict) and "optimizer" in obj:
+        optimizer.load_state_dict(obj["optimizer"])
+        print("✔ optimizer restored")
+    if isinstance(obj, dict) and "scaler" in obj:
+        scaler.load_state_dict(obj["scaler"])
+        print("✔ GradScaler restored")
+
+    start_epoch = obj["epoch"] if isinstance(obj, dict) and "epoch" in obj else 0
+    print(f"▶ Resume from epoch {start_epoch}")
+    return start_epoch
+
 
 # ---------------------- Training ---------------------- #
 def train():
     # ハイパラ & パス
     img_size = 1024
     batch_size = 4
-    num_epochs = 20
+    TOTAL_EPOCHS   = 40
     lr = 1e-5
+    VIS_EVERY = 500         # 何ステップごとに保存するか
+    CLICKS_PER_MASK = 4
+    CKPT_PATH      = "checkpoints/sam2_hiera_small.pt"
+    MODEL_CFG      = "sam2_hiera_s"
     
     wandb.init(
     project="sam2-manga",            # 好きなプロジェクト名
@@ -95,7 +152,7 @@ def train():
         img_size   = img_size,
         batch_size = batch_size,
         lr         = lr,
-        epochs     = num_epochs,
+        epochs     = TOTAL_EPOCHS,
         backbone   = "sam2_hiera_small",
     ),
     # sync_tensorboard=True  # TensorBoard 併用ならコメント解除
@@ -103,8 +160,6 @@ def train():
 
     root_dir = "data"
     ann_file = "data/annotations/manga_balloon.json"
-    checkpoint_path = "checkpoints/sam2_hiera_small.pt"
-    model_cfg = "sam2_hiera_s"      # .yaml を付けない
 
     # デバイス
     if torch.backends.mps.is_available():
@@ -124,84 +179,116 @@ def train():
                         shuffle=True, num_workers=0)
 
     # モデル
-    sam2_model = build_sam2(model_cfg, checkpoint_path, device=device)
-    predictor = SAM2ImagePredictor(sam2_model)
-    optimizer = torch.optim.AdamW(predictor.model.parameters(), lr=lr, weight_decay=4e-5)
+    model = build_sam2(MODEL_CFG, None, device=device)
+    predictor = SAM2ImagePredictor(model)
+    optimizer   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=4e-5)
+    scaler      = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+
+    start_epoch = resume_or_initialize(model, optimizer, scaler, CKPT_PATH)
+    global_step = start_epoch * len(loader)
+    
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=0.1)  # 4 epoch ごとに 1/10
 
     global_step, mean_iou = 0, 0.0
-    
 
-    for epoch in range(num_epochs):
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch")
+    samples_dir = Path("samples"); samples_dir.mkdir(exist_ok=True, parents=True)
+    checkpoints_dir = Path("checkpoints"); checkpoints_dir.mkdir(exist_ok=True)
+
+    for epoch in range(start_epoch, TOTAL_EPOCHS):
+        pbar = tqdm(loader, desc=f"E{epoch+1}/{TOTAL_EPOCHS}", unit="batch")
         for step, batch in enumerate(pbar):
-            global_step = epoch * len(loader) + step
-            imgs = batch["image"].to(device)
+            global_step += 1
+            imgs   = batch["image"].to(device)
             masks_gt = batch["mask"].to(device)
 
-            # predictor が受ける形式へ変換 (List[np.ndarray])
-            imgs_np = [(img * 255).byte().permute(1, 2, 0).cpu().numpy() for img in imgs]
-            # ランダムクリック生成
-            pts = random_click_points(masks_gt)
-            lbl = np.ones((len(pts), 1), dtype=np.int64)
+            # クリック生成
+            point_coords = sample_points(masks_gt, n_pts=CLICKS_PER_MASK)   # (B,N,2)
+            point_labels = np.ones(point_coords.shape[:2], dtype=np.int64)  # (B,N)
 
-            from contextlib import nullcontext
+            # 画像を list[np.ndarray] → predictor
+            imgs_np = [(img * 255).byte().permute(1, 2, 0).cpu().numpy()
+                       for img in imgs]
+            predictor.set_image_batch(imgs_np)
+
             amp_ctx = torch.cuda.amp.autocast(enabled=True) if device == "cuda" else nullcontext()
             with amp_ctx:
-                predictor.set_image_batch(imgs_np)
-
+                # prompt encoder
                 mask_in, coords_t, labels_t, _ = predictor._prep_prompts(
-                    pts, lbl, box=None, mask_logits=None, normalize_coords=True
-                )
+                    point_coords, point_labels,
+                    box=None, mask_logits=None, normalize_coords=True)
                 sparse_emb, dense_emb = predictor.model.sam_prompt_encoder(
-                    points=(coords_t, labels_t), boxes=None, masks=None)
+                    points=(coords_t, labels_t),
+                    boxes=None, masks=None)
 
-                high_res_feats = [f[-1].unsqueeze(0)
-                                  for f in predictor._features["high_res_feats"]]
-
-                low_masks, scores, _, _ = predictor.model.sam_mask_decoder(
+                # mask decoder
+                hi_feats = [f[-1].unsqueeze(0)
+                            for f in predictor._features["high_res_feats"]]
+                low_masks, scores, *_ = predictor.model.sam_mask_decoder(
                     image_embeddings=predictor._features["image_embed"],
                     image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=sparse_emb,
                     dense_prompt_embeddings=dense_emb,
-                    multimask_output=True,
+                    multimask_output=False,
                     repeat_image=False,
-                    high_res_features=high_res_feats)
-
+                    high_res_features=hi_feats)
                 masks_pred = predictor._transforms.postprocess_masks(
                     low_masks, predictor._orig_hw[-1])
-                masks_pred = torch.sigmoid(masks_pred[:, 0]).unsqueeze(1)  # [B, 1, H, W]
+                masks_pred = torch.sigmoid(masks_pred[:, 0]).unsqueeze(1)
 
-                # 損失
+                # --- loss ---
                 eps = 1e-6
-                seg_loss = (-masks_gt * torch.log(masks_pred + eps) -
-                            (1 - masks_gt) * torch.log(1 - masks_pred + eps)).mean()
+                # Balanced BCE
+                pos_pix = masks_gt.mean().item()
+                bce = F.binary_cross_entropy(
+                    masks_pred, masks_gt,
+                    weight=masks_gt * (1-pos_pix) + (1-masks_gt) * pos_pix)
+                # Dice
+                inter = (masks_pred * masks_gt).sum((1,2,3))
+                dice = 1 - (2*inter + eps) / (masks_pred.sum((1,2,3))
+                                               + masks_gt.sum((1,2,3)) + eps)
+                loss = bce + dice.mean()
 
-                inter = (masks_gt * (masks_pred > 0.5)).sum((1, 2, 3))
-                union = masks_gt.sum((1, 2, 3)) + \
-                    (masks_pred > 0.5).sum((1, 2, 3)) - inter
-                iou = inter / (union + eps)
-                score_loss = torch.abs(scores[:, 0] - iou).mean()
-
-                loss = seg_loss + 0.05 * score_loss
-
+            # --- backward ---
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            mean_iou = 0.99 * mean_iou + 0.01 * iou.mean().item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}",
-                             iou=f"{mean_iou:.3f}")
-            wandb.log({
-            "train/loss":  loss.item(),
-            "train/iou":   iou.mean().item(),
-            "lr":          optimizer.param_groups[0]["lr"],
-            "epoch_step":  epoch + step / len(loader),   # 進捗を float で
-        }, step=global_step)
+            # --- metrics ---
+            with torch.no_grad():
+                pred_bin = (masks_pred > 0.5).float()
+                inter = (pred_bin * masks_gt).sum((1,2,3))
+                union = masks_gt.sum((1,2,3)) + pred_bin.sum((1,2,3)) - inter
+                iou = (inter / (union + eps)).mean().item()
 
-        # 各エポックで保存
-        torch.save(predictor.model.state_dict(),
-                   f"checkpoints/sam2_manga_epoch{epoch+1}.pt")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", iou=f"{iou:.3f}")
+
+            # --- wandb log (optional) ---
+            wandb.log({"train/loss": loss.item(),
+                       "train/iou":  iou,
+                       "lr": optimizer.param_groups[0]["lr"],
+                       "epoch_step": epoch + step/len(loader)},
+                      step=global_step)
+
+            # --- Save sample PNGs ---
+            if global_step % VIS_EVERY == 0:
+                gt_np   = (masks_gt[0,0]*255).cpu().byte().numpy()
+                pred_np = (pred_bin[0,0]*255).cpu().byte().numpy()
+                cv2.imwrite(str(samples_dir /
+                           f"e{epoch+1:02d}_s{global_step}_gt.png"), gt_np)
+                cv2.imwrite(str(samples_dir /
+                           f"e{epoch+1:02d}_s{global_step}_pred.png"), pred_np)
+
+        # --- epoch end ---
+        scheduler.step()
+
+        torch.save({
+            "model":     model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler":    scaler.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch":     epoch + 1,
+        }, checkpoints_dir / f"sam2_manga_epoch{epoch+1}.pt")
 
 
 # ---------------------- Entry ---------------------- #
