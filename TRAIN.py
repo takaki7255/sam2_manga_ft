@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """
 Train SAM-2 on Manga Balloon COCO Dataset
 ディレクトリ例:
@@ -22,6 +21,7 @@ from tqdm import tqdm
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+import wandb
 
 
 # ---------------------- Dataset ---------------------- #
@@ -86,6 +86,20 @@ def train():
     img_size = 1024
     batch_size = 4
     num_epochs = 20
+    lr = 1e-5
+    
+    wandb.init(
+    project="sam2-manga",            # 好きなプロジェクト名
+    name   ="hiera_small_bs4_lr1e-5",# 任意：Run 名
+    config = dict(
+        img_size   = img_size,
+        batch_size = batch_size,
+        lr         = lr,
+        epochs     = num_epochs,
+        backbone   = "sam2_hiera_small",
+    ),
+    # sync_tensorboard=True  # TensorBoard 併用ならコメント解除
+)
 
     root_dir = "data"
     ann_file = "data/annotations/manga_balloon.json"
@@ -99,6 +113,7 @@ def train():
         device = "cuda"
     else:
         device = "cpu"
+    print(f"Using device: {device}")
 
     amp_enable = device == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enable)
@@ -111,15 +126,15 @@ def train():
     # モデル
     sam2_model = build_sam2(model_cfg, checkpoint_path, device=device)
     predictor = SAM2ImagePredictor(sam2_model)
-    optimizer = torch.optim.AdamW(predictor.model.parameters(),
-                                  lr=1e-5, weight_decay=4e-5)
+    optimizer = torch.optim.AdamW(predictor.model.parameters(), lr=lr, weight_decay=4e-5)
 
     global_step, mean_iou = 0, 0.0
+    
 
     for epoch in range(num_epochs):
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch")
-        for batch in pbar:
-            global_step += 1
+        for step, batch in enumerate(pbar):
+            global_step = epoch * len(loader) + step
             imgs = batch["image"].to(device)
             masks_gt = batch["mask"].to(device)
 
@@ -177,6 +192,12 @@ def train():
             mean_iou = 0.99 * mean_iou + 0.01 * iou.mean().item()
             pbar.set_postfix(loss=f"{loss.item():.4f}",
                              iou=f"{mean_iou:.3f}")
+            wandb.log({
+            "train/loss":  loss.item(),
+            "train/iou":   iou.mean().item(),
+            "lr":          optimizer.param_groups[0]["lr"],
+            "epoch_step":  epoch + step / len(loader),   # 進捗を float で
+        }, step=global_step)
 
         # 各エポックで保存
         torch.save(predictor.model.state_dict(),

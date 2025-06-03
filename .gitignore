@@ -9,3 +9,5 @@ _C.*
 outputs/*
 checkpoints/*.pt
 data/*
+wandb/*
+test_data/*
