@@ -144,12 +144,12 @@ def train():
     CLICKS_PER_MASK = 4
     CKPT_PATH      = "checkpoints/sam2_hiera_small.pt"
     MODEL_CFG      = "sam2_hiera_s"
-    SAVE_FREQ      = 5          # ★ 何エポックごとに保存するか
+    SAVE_FREQ      = 1          # ★ 何エポックごとに保存するか
     BEST_PATH      = "checkpoints/best_miou.pt"   # ★ ベストモデル保存先
     
     wandb.init(
-    project="sam2-manga",            # 好きなプロジェクト名
-    name   ="hiera_small_bs4_lr1e-5",# 任意：Run 名
+    project="sam2-manga",            
+    name   ="hiera_small_bs4_lr1e-5",
     config = dict(
         img_size   = img_size,
         batch_size = batch_size,
