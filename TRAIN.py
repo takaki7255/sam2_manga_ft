@@ -138,7 +138,7 @@ def train():
     # ハイパラ & パス
     img_size = 1024
     batch_size = 4
-    TOTAL_EPOCHS   = 40
+    TOTAL_EPOCHS   = 100
     lr = 1e-5
     VIS_EVERY = 500         # 何ステップごとに保存するか
     CLICKS_PER_MASK = 4
